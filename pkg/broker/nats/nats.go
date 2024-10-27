@@ -11,6 +11,7 @@ import (
 	"go.ytsaurus.tech/yt/go/ypath"
 	"log/slog"
 	"reflect"
+	"sync"
 	"time"
 )
 
@@ -101,10 +102,11 @@ func (b *CurrentBroker) SubStream(ctx context.Context, stream, consName, tablePa
 		return
 	}
 
+	// +1 because of duplicates
 	consumer, err := js.CreateConsumer(ctx, stream, jetstream.ConsumerConfig{
 		AckPolicy:     jetstream.AckAllPolicy,
 		DeliverPolicy: jetstream.DeliverByStartSequencePolicy,
-		OptStartSeq:   streamDTO.Offset,
+		OptStartSeq:   streamDTO.Offset + 1,
 	})
 	if err != nil {
 		log.Error("failed to create consumer",
@@ -124,41 +126,40 @@ func (b *CurrentBroker) SubStream(ctx context.Context, stream, consName, tablePa
 	dataStruct := hell.BornShit(schemaDTOs)
 	var (
 		consumerInfo *jetstream.ConsumerInfo
-		batch        jetstream.MessageBatch
+		mu           sync.Mutex
 	)
-	_ = consumerInfo
+	batch := make(chan jetstream.Msg, batchSize)
+	defer close(batch)
+	_, err = consumer.Consume(func(msg jetstream.Msg) {
+		batch <- msg
+		log.Info("new message was received", string(msg.Data()))
+	}, jetstream.PullMaxMessages(batchSize))
+	if err != nil {
+		log.Error("failed to consumer message", slog.String("op", op), slog.String("error", err.Error()))
+		return
+	}
 
 	for {
-		consumerInfo, err = consumer.Info(ctx)
-		if err != nil {
-			log.Error("failed to get consumer info",
-				slog.String("op", op),
-				slog.String("error", err.Error()),
-			)
-			return
+		mu.Lock()
+		if len(batch) > 0 {
+			consumerInfo, err = consumer.Info(ctx)
+			if err != nil {
+				log.Error("failed to get consumer info",
+					slog.String("op", op),
+					slog.String("error", err.Error()),
+				)
+				return
+			}
+			log.Info("Consumer info was received", slog.String("op", op), slog.Uint64("offset", consumerInfo.Delivered.Stream))
+			if err = parseAndWriteToYT(ctx, batch, log, ytAdapter, stream, tablePath, dataStruct); err != nil {
+				log.Error("failed to parse and write to YT",
+					slog.String("op", op),
+					slog.String("error", err.Error()),
+				)
+				return
+			}
 		}
-		log.Info("consumer info was received", slog.String("op", op),
-			slog.Uint64("stream seq", consumerInfo.Delivered.Stream))
-
-		batch, err = consumer.Fetch(batchSize, jetstream.FetchMaxWait(5*time.Second))
-		if err != nil {
-			log.Error("failed to fetch batch", slog.String("op", op), slog.String("error", err.Error()))
-			return
-		}
-		time.Sleep(5 * time.Second)
-
-		messages := batch.Messages()
-		if len(messages) == 0 {
-			continue
-		}
-
-		if err = parseAndWriteToYT(ctx, messages, log, ytAdapter, stream, tablePath, dataStruct); err != nil {
-			log.Error("failed to parse and write to YT",
-				slog.String("op", op),
-				slog.String("error", err.Error()),
-			)
-			return
-		}
+		mu.Unlock()
 	}
 }
 
