@@ -1,0 +1,9 @@
+nats:
+  stream_name:
+  consumer_name:
+  address:
+
+ytsaurus:
+  proxy:
+  token:
+  table_path:
