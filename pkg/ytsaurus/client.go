@@ -48,7 +48,7 @@ func (a *YTAdapter) GetStartOffset(ctx context.Context, tablePath, stream string
 	if err := a.Client.GetNode(ctx, offsetPath, &resultDTO.OffsetDTO, nil); err != nil {
 		var ok bool
 		if ok, err = a.Client.NodeExists(ctx, offsetPath, nil); err != nil || !ok {
-			resultDTO.OffsetDTO.Offset = 1
+			resultDTO.OffsetDTO.Offset = 0
 			if err = a.Client.SetNode(ctx, offsetPath, resultDTO.OffsetDTO, nil); err != nil {
 				return resultDTO, fmt.Errorf("%s SetNode: %w", op, err)
 			}

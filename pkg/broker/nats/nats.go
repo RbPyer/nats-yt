@@ -11,7 +11,6 @@ import (
 	"go.ytsaurus.tech/yt/go/ypath"
 	"log/slog"
 	"reflect"
-	"sync"
 	"time"
 )
 
@@ -19,56 +18,11 @@ const batchSize = 10
 
 type Broker interface {
 	SubStream(ctx context.Context, stream, consName, tablePath string, done chan struct{}, ytAdapter *ytsaurus.YTAdapter)
-	TestConsumer(ctx context.Context, stream string) error
 }
 
 type CurrentBroker struct {
 	nc *nats.Conn
-}
-
-func (b *CurrentBroker) TestConsumer(ctx context.Context, stream string) error {
-	const op = "nats.TestConsumer"
-
-	js, err := jetstream.New(b.nc)
-	if err != nil {
-		return err
-	}
-
-	consumer, err := js.CreateConsumer(ctx, stream, jetstream.ConsumerConfig{
-		AckPolicy:     jetstream.AckAllPolicy,
-		DeliverPolicy: jetstream.DeliverByStartSequencePolicy,
-		OptStartSeq:   1,
-	})
-
-	if err != nil {
-		return err
-	}
-	var (
-		consumerInfo *jetstream.ConsumerInfo
-		batch        jetstream.MessageBatch
-	)
-
-	for {
-		consumerInfo, err = consumer.Info(ctx)
-		if err != nil {
-			return err
-		}
-		fmt.Printf("Stream seq: %d\n", consumerInfo.Delivered.Stream)
-
-		batch, err = consumer.Fetch(batchSize, jetstream.FetchMaxWait(1*time.Second))
-		if err != nil {
-			return fmt.Errorf("%s: %w", op, err)
-		}
-
-		for msg := range batch.Messages() {
-			fmt.Printf("New message: %s\n", string(msg.Data()))
-			err = msg.Ack()
-			if err != nil {
-				return fmt.Errorf("%s: %w", op, err)
-			}
-		}
-	}
-
+	js jetstream.JetStream
 }
 
 func (b *CurrentBroker) SubStream(ctx context.Context, stream, consName, tablePath string, done chan struct{}, ytAdapter *ytsaurus.YTAdapter) {
@@ -76,12 +30,13 @@ func (b *CurrentBroker) SubStream(ctx context.Context, stream, consName, tablePa
 		done <- struct{}{}
 		close(done)
 	}()
-	const op = "nats.Substream"
-	var err error
+
+	const op = "nats.Substream1"
 	log, ok := ctx.Value("log").(*slog.Logger)
 	if !ok {
 		return
 	}
+
 	streamDTO, err := ytAdapter.GetStartOffset(ctx, tablePath, stream)
 	if err != nil {
 		log.Error(
@@ -93,17 +48,8 @@ func (b *CurrentBroker) SubStream(ctx context.Context, stream, consName, tablePa
 	}
 	log.Info("Getting offset", slog.String("op", op), slog.Uint64("offset", streamDTO.Offset))
 
-	js, err := jetstream.New(b.nc)
-	if err != nil {
-		log.Error("failed to create Jetstream instance",
-			slog.String("op", op),
-			slog.String("error", err.Error()),
-		)
-		return
-	}
-
 	// +1 because of duplicates
-	consumer, err := js.CreateConsumer(ctx, stream, jetstream.ConsumerConfig{
+	consumer, err := b.js.CreateConsumer(ctx, stream, jetstream.ConsumerConfig{
 		AckPolicy:     jetstream.AckAllPolicy,
 		DeliverPolicy: jetstream.DeliverByStartSequencePolicy,
 		OptStartSeq:   streamDTO.Offset + 1,
@@ -124,46 +70,58 @@ func (b *CurrentBroker) SubStream(ctx context.Context, stream, consName, tablePa
 	log.Info("node info was received", slog.String("op", op))
 
 	dataStruct := hell.BornShit(schemaDTOs)
-	var (
-		consumerInfo *jetstream.ConsumerInfo
-		mu           sync.Mutex
-	)
-	batch := make(chan jetstream.Msg, batchSize)
-	defer close(batch)
-	_, err = consumer.Consume(func(msg jetstream.Msg) {
-		batch <- msg
-		log.Info("new message was received", string(msg.Data()))
-	}, jetstream.PullMaxMessages(batchSize))
-	if err != nil {
-		log.Error("failed to consumer message", slog.String("op", op), slog.String("error", err.Error()))
-		return
-	}
 
-	for {
-		mu.Lock()
-		if len(batch) > 0 {
-			consumerInfo, err = consumer.Info(ctx)
-			if err != nil {
-				log.Error("failed to get consumer info",
-					slog.String("op", op),
-					slog.String("error", err.Error()),
-				)
-				return
-			}
-			log.Info("Consumer info was received", slog.String("op", op), slog.Uint64("offset", consumerInfo.Delivered.Stream))
-			if err = parseAndWriteToYT(ctx, batch, log, ytAdapter, stream, tablePath, dataStruct); err != nil {
-				log.Error("failed to parse and write to YT",
-					slog.String("op", op),
-					slog.String("error", err.Error()),
-				)
-				return
-			}
-		}
-		mu.Unlock()
+	if err = handleBatches(ctx, consumer, log, ytAdapter, stream, tablePath, dataStruct); err != nil {
+		log.Error("failed to handle batches", slog.String("error", err.Error()))
+		return
 	}
 }
 
-func parseAndWriteToYT(ctx context.Context, messages <-chan jetstream.Msg, log *slog.Logger,
+func handleBatches(ctx context.Context, consumer jetstream.Consumer, log *slog.Logger, ytAdapter *ytsaurus.YTAdapter,
+	stream, tablePath string, dataStruct reflect.Type) error {
+
+	const op = "nats.ytConsumer.handleBatches"
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			batch, err := consumer.Fetch(batchSize)
+			if err != nil {
+				return fmt.Errorf("%s: %w", op, err)
+			}
+
+			msgs := make(chan jetstream.Msg, batchSize)
+
+			tryToReadBatch(ctx, batch.Messages(), msgs)
+
+			if len(msgs) < 1 {
+				continue
+			}
+			log.Info("new messages are available")
+
+			if err = parseAndWriteToYT(ctx, msgs, ytAdapter, stream, tablePath, dataStruct); err != nil {
+				return fmt.Errorf("%s: %w", op, err)
+			}
+		}
+	}
+}
+
+func tryToReadBatch(ctx context.Context, batch <-chan jetstream.Msg, msgs chan<- jetstream.Msg) {
+	ctx, cancel := context.WithTimeout(ctx, 1*time.Second)
+	defer cancel()
+
+	select {
+	case <-ctx.Done():
+		close(msgs)
+		return
+	case msg := <-batch:
+		msgs <- msg
+	}
+}
+
+func parseAndWriteToYT(ctx context.Context, messages <-chan jetstream.Msg,
 	ytAdapter *ytsaurus.YTAdapter, stream, tablePath string, dataStruct reflect.Type) error {
 
 	const op = "nats.parseAndWriteToYT"
@@ -181,10 +139,8 @@ func parseAndWriteToYT(ctx context.Context, messages <-chan jetstream.Msg, log *
 		return fmt.Errorf("%s: %w", op, err)
 	}
 
-	log.Info("received new messages", slog.String("op", op), slog.Int("current batch size", len(messages)))
 	for msg := range messages {
 		if err = json.Unmarshal(msg.Data(), &dataStructInstance); err != nil {
-			log.Error("failed to unmarshal data")
 			if txErr := tx.Abort(); txErr != nil {
 				panic(fmt.Sprintf("FAILED TO ABORT TRANSACTION: %s", txErr.Error()))
 			}
@@ -192,7 +148,6 @@ func parseAndWriteToYT(ctx context.Context, messages <-chan jetstream.Msg, log *
 		}
 
 		if err = writer.Write(dataStructInstance); err != nil {
-			log.Error("failed to write data")
 			if txErr := tx.Abort(); txErr != nil {
 				panic(fmt.Sprintf("FAILED TO ABORT TRANSACTION: %s", txErr.Error()))
 			}
@@ -200,10 +155,8 @@ func parseAndWriteToYT(ctx context.Context, messages <-chan jetstream.Msg, log *
 		}
 
 		if len(messages) == 0 {
-			log.Info("data", slog.String("op", op), slog.Any("data", dataStructInstance))
-			log.Info("tablepath", slog.String("tablepath", tablePath))
 			if err = writer.Commit(); err != nil {
-				log.Error("failed to commit data in writer", slog.String("op", op), slog.String("error", err.Error()))
+				fmt.Println(err)
 				if txErr := tx.Abort(); txErr != nil {
 					panic(fmt.Sprintf("FAILED TO ABORT TRANSACTION: %s", txErr.Error()))
 				}
@@ -213,7 +166,6 @@ func parseAndWriteToYT(ctx context.Context, messages <-chan jetstream.Msg, log *
 			var metadata *jetstream.MsgMetadata
 			metadata, err = msg.Metadata()
 			if err != nil {
-				log.Error("failed to get message metadata", slog.String("op", op), slog.String("error", err.Error()))
 				if txErr := tx.Abort(); txErr != nil {
 					panic(fmt.Sprintf("FAILED TO ABORT TRANSACTION: %s", txErr.Error()))
 				}
@@ -221,7 +173,6 @@ func parseAndWriteToYT(ctx context.Context, messages <-chan jetstream.Msg, log *
 			}
 
 			if err = ytsaurus.SetStreamOffset(ctx, tx, tablePath, stream, metadata.Sequence.Stream); err != nil {
-				log.Error("failed to set offset", slog.String("op", op), slog.String("error", err.Error()))
 				if txErr := tx.Abort(); txErr != nil {
 					panic(fmt.Sprintf("FAILED TO ABORT TRANSACTION: %s", txErr.Error()))
 				}
@@ -247,5 +198,9 @@ func New(address string) (Broker, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &CurrentBroker{nc: nc}, nil
+	js, err := jetstream.New(nc)
+	if err != nil {
+		return nil, err
+	}
+	return &CurrentBroker{nc: nc, js: js}, nil
 }
