@@ -46,5 +46,4 @@ func TestWriteTable(t *testing.T) {
 	if err = writer.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	t.Log("Ahuenna")
 }
