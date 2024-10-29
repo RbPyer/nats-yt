@@ -42,11 +42,11 @@ func (a *YTAdapter) GetNodeInfo(ctx context.Context, tablePath string) ([]models
 func (a *YTAdapter) GetStartOffset(ctx context.Context, tablePath, stream string) (models.StreamDTO, error) {
 	const op = "ytsaurus.GetStartOffset"
 
+	var ok bool
 	resultDTO := models.StreamDTO{Stream: stream}
 	offsetPath := ypath.Path(fmt.Sprintf("%s/@%s", tablePath, stream))
 
 	if err := a.Client.GetNode(ctx, offsetPath, &resultDTO.OffsetDTO, nil); err != nil {
-		var ok bool
 		if ok, err = a.Client.NodeExists(ctx, offsetPath, nil); err != nil || !ok {
 			resultDTO.OffsetDTO.Offset = 0
 			if err = a.Client.SetNode(ctx, offsetPath, resultDTO.OffsetDTO, nil); err != nil {

@@ -81,29 +81,25 @@ func handleBatches(ctx context.Context, consumer jetstream.Consumer, log *slog.L
 	stream, tablePath string, dataStruct reflect.Type) error {
 
 	const op = "nats.ytConsumer.handleBatches"
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
 
 	for {
-		select {
-		case <-ticker.C:
-			batch, err := consumer.Fetch(batchSize)
-			if err != nil {
-				return fmt.Errorf("%s: %w", op, err)
-			}
 
-			msgs := make(chan jetstream.Msg, batchSize)
+		batch, err := consumer.FetchNoWait(batchSize)
+		if err != nil {
+			return fmt.Errorf("%s: %w", op, err)
+		}
 
-			tryToReadBatch(ctx, batch.Messages(), msgs)
+		msgs := make(chan jetstream.Msg, batchSize)
 
-			if len(msgs) < 1 {
-				continue
-			}
-			log.Info("new messages are available")
+		tryToReadBatch(ctx, batch.Messages(), msgs)
 
-			if err = parseAndWriteToYT(ctx, msgs, ytAdapter, stream, tablePath, dataStruct); err != nil {
-				return fmt.Errorf("%s: %w", op, err)
-			}
+		if len(msgs) < 1 {
+			continue
+		}
+		log.Info("new messages are available")
+
+		if err = parseAndWriteToYT(ctx, msgs, ytAdapter, stream, tablePath, dataStruct); err != nil {
+			return fmt.Errorf("%s: %w", op, err)
 		}
 	}
 }
@@ -117,7 +113,9 @@ func tryToReadBatch(ctx context.Context, batch <-chan jetstream.Msg, msgs chan<-
 		close(msgs)
 		return
 	case msg := <-batch:
-		msgs <- msg
+		if msg != nil {
+			msgs <- msg
+		}
 	}
 }
 
