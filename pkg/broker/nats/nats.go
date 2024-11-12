@@ -2,7 +2,7 @@ package nats
 
 import (
 	"context"
-	"danilov/internal/hell"
+	"danilov/internal/lib/structs"
 	"danilov/pkg/ytsaurus"
 	"encoding/json"
 	"fmt"
@@ -68,8 +68,7 @@ func (b *CurrentBroker) SubStream(ctx context.Context, stream, consName, tablePa
 		return
 	}
 	log.Info("node info was received", slog.String("op", op))
-
-	dataStruct := hell.BornShit(schemaDTOs)
+	dataStruct := structs.CreateDataStruct(schemaDTOs)
 
 	if err = handleBatches(ctx, consumer, log, ytAdapter, stream, tablePath, dataStruct); err != nil {
 		log.Error("failed to handle batches", slog.String("error", err.Error()))
@@ -83,7 +82,6 @@ func handleBatches(ctx context.Context, consumer jetstream.Consumer, log *slog.L
 	const op = "nats.ytConsumer.handleBatches"
 
 	for {
-
 		batch, err := consumer.FetchNoWait(batchSize)
 		if err != nil {
 			return fmt.Errorf("%s: %w", op, err)
@@ -91,7 +89,9 @@ func handleBatches(ctx context.Context, consumer jetstream.Consumer, log *slog.L
 
 		msgs := make(chan jetstream.Msg, batchSize)
 
-		tryToReadBatch(ctx, batch.Messages(), msgs)
+		for msg := range batch.Messages() {
+			msgs <- msg
+		}
 
 		if len(msgs) < 1 {
 			continue
@@ -104,21 +104,7 @@ func handleBatches(ctx context.Context, consumer jetstream.Consumer, log *slog.L
 	}
 }
 
-func tryToReadBatch(ctx context.Context, batch <-chan jetstream.Msg, msgs chan<- jetstream.Msg) {
-	ctx, cancel := context.WithTimeout(ctx, 1*time.Second)
-	defer cancel()
-
-	select {
-	case <-ctx.Done():
-		close(msgs)
-		return
-	case msg := <-batch:
-		if msg != nil {
-			msgs <- msg
-		}
-	}
-}
-
+// TODO: refactoring
 func parseAndWriteToYT(ctx context.Context, messages <-chan jetstream.Msg,
 	ytAdapter *ytsaurus.YTAdapter, stream, tablePath string, dataStruct reflect.Type) error {
 

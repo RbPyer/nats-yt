@@ -3,7 +3,7 @@ package writeTable
 import (
 	"context"
 	"danilov/internal/config"
-	"danilov/internal/hell"
+	"danilov/internal/lib/structs"
 	"danilov/pkg/ytsaurus"
 	"encoding/json"
 	"fmt"
@@ -28,7 +28,7 @@ func TestWriteTable(t *testing.T) {
 	}
 	t.Log(dtos)
 
-	shitStruct := hell.BornShit(dtos)
+	shitStruct := structs.CreateDataStruct(dtos)
 	shitInstance := reflect.New(shitStruct).Interface()
 
 	writer, err := adapter.Client.WriteTable(ctx, ypath.Path(cfg.TablePath), nil)

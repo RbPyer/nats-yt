@@ -1,4 +1,4 @@
-package hell
+package structs
 
 import (
 	"danilov/pkg/models"
@@ -8,7 +8,7 @@ import (
 	"reflect"
 )
 
-func BornShit(fieldsInfo []models.SchemaDTO) reflect.Type {
+func CreateDataStruct(fieldsInfo []models.SchemaDTO) reflect.Type {
 	var fieldType reflect.Type
 
 	fieldsLen := len(fieldsInfo)
